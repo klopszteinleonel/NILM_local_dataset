@@ -12,6 +12,7 @@ Flujo:
     5. Los guarda en archivos locales:
          corriente: <directorio>/<timestamp>_<categoria>.json      (formato historico)
          tension:   <directorio>/<timestamp>_<categoria>_v.json
+       Si se indican --equipo y --estado, se agregan a los dos archivos. No se envian al nodo.
 
 La subida a MariaDB la realiza un script separado (no incluido aqui).
 
@@ -22,6 +23,8 @@ Uso:
     python3 capturar.py --categoria nada --lugar living --duracion 1.0          # sin carga
     python3 capturar.py --categoria aire --canal v                              # solo tension
     python3 capturar.py --categoria aire --canal iv                             # corriente + tension sincronizadas
+    python3 capturar.py --categoria heladera --lugar casa3 --canal iv --equipo heladera_gafa --estado recien_arrancada
+    python3 capturar.py --categoria "aire,luces" --lugar casa3 --canal iv --equipo "aire_ventana,lampara_led" --estado "frio,3_lamparas"
 """
 
 import argparse
@@ -53,6 +56,60 @@ def leer_ack(s):
     return ack.strip()
 
 
+AYUDA_FINAL = """
+equipo y estado:
+  Sirven para saber despues que aparato se midio y que estaba haciendo. Sin esto
+  no se puede reconstruir: dos capturas de "aire" pueden ser dos equipos distintos.
+
+  --equipo  Nombre que inventas para ese aparato fisico. Usa SIEMPRE el mismo nombre
+            para el mismo aparato, aunque lo midas otro dia o en otro lugar, y un
+            nombre distinto para otro aparato de la misma categoria.
+            Ejemplos: pava_negra, aire_ventana_local, heladera_gafa, lampara_led_living
+
+  --estado  Que esta haciendo el aparato durante la captura.
+            Ejemplos: recien_arrancada, estable, frio, calor, lavado, centrifugado,
+            3_lamparas, tele_encendida, potencia_maxima
+
+  Son opcionales, pero si faltan se muestra un aviso. Con --categoria nada no hacen falta.
+
+capturas combinadas:
+  Un valor por cada carga, separados por coma y en el MISMO orden que --categoria.
+  Si un dato no se sabe o no aplica, poner un guion en esa posicion.
+    --categoria "aire,luces" --equipo "aire_ventana,lampara_led" --estado "frio,-"
+
+ejemplos:
+  python3 capturar.py --categoria pava --lugar casa3 --canal iv --equipo pava_negra --estado estable
+  python3 capturar.py --categoria heladera --lugar casa3 --canal iv --equipo heladera_gafa --estado recien_arrancada
+  python3 capturar.py --categoria "aire,luces" --lugar casa3 --canal iv --equipo "aire_ventana,lampara_led" --estado "frio,3_lamparas"
+  python3 capturar.py --categoria nada --lugar casa3 --canal iv
+
+Solo se permiten letras sin acento, numeros, '_', '-', ',' y espacios.
+"""
+
+
+def validar_por_carga(nombre, valor, n_cargas):
+    """Devuelve el texto listo para guardar. Exige un valor por carga, en el orden de --categoria."""
+    partes = [p.strip() for p in valor.split(",")]
+    if any(not p for p in partes):
+        print(f"[ERROR] '--{nombre}' tiene un valor vacio. Si no se sabe o no aplica, usa un guion: "
+              f"--{nombre} \"{','.join(p or '-' for p in partes)}\"", file=sys.stderr)
+        sys.exit(1)
+    if len(partes) != n_cargas:
+        print(f"[ERROR] --categoria tiene {n_cargas} carga(s) pero --{nombre} tiene {len(partes)} valor(es). "
+              "Tiene que haber uno por carga, en el mismo orden (guion si no aplica). Ver --help", file=sys.stderr)
+        sys.exit(1)
+    return ",".join(partes)
+
+
+def agregar_metadatos(paquete, metadatos):
+    """Devuelve el paquete con los metadatos antes de 'datos', para que se lean en el encabezado."""
+    salida = {k: v for k, v in paquete.items() if k != "datos"}
+    salida.update(metadatos)
+    if "datos" in paquete:
+        salida["datos"] = paquete["datos"]
+    return salida
+
+
 def decodificar_paquetes(buf):
     """Decodifica uno o mas objetos JSON concatenados (separados por espacios o '\n')."""
     texto = buf.decode("utf-8")
@@ -74,9 +131,14 @@ def decodificar_paquetes(buf):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Comandar y guardar una captura del nodo NILM")
+    ap = argparse.ArgumentParser(description="Comandar y guardar una captura del nodo NILM",
+                                 epilog=AYUDA_FINAL, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--categoria", required=True, help="categoria de la medicion")
     ap.add_argument("--lugar", default="desconocido", help="lugar de la medicion")
+    ap.add_argument("--equipo", help="nombre del aparato fisico medido; en combinadas, uno por carga separados "
+                                     "por coma (explicado abajo)")
+    ap.add_argument("--estado", help="que esta haciendo el aparato durante la captura; en combinadas, uno por "
+                                     "carga separados por coma (explicado abajo)")
     ap.add_argument("--duracion", type=float, default=1.0, help="duracion en segundos")
     ap.add_argument("--canal", choices=("i", "v", "iv"), default="i",
                     help="i = corriente (CH0), v = tension (CH1), iv = ambas sincronizadas")
@@ -88,7 +150,8 @@ def main():
     # Validar categoria y lugar (solo caracteres seguros para evitar JSON roto)
     # La coma separa clases en capturas combinadas: --categoria "aire,tele"
     caracteres_validos = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_- ,"
-    for nombre, valor in (("categoria", args.categoria), ("lugar", args.lugar)):
+    for nombre, valor in (("categoria", args.categoria), ("lugar", args.lugar),
+                          ("equipo", args.equipo or "-"), ("estado", args.estado or "-")):
         valor = valor.strip()
         if not valor:
             print(f"[ERROR] El campo '{nombre}' no puede estar vacio", file=sys.stderr)
@@ -100,6 +163,15 @@ def main():
 
     categoria = args.categoria.strip()
     lugar = args.lugar.strip()
+
+    cargas = [c.strip() for c in categoria.split(",") if c.strip()]
+    sin_carga = cargas == ["nada"]
+    metadatos = {}
+    for nombre, valor in (("equipo", args.equipo), ("estado", args.estado)):
+        if valor is not None:
+            metadatos[nombre] = validar_por_carga(nombre, valor, len(cargas))
+        elif not sin_carga:
+            print(f"[AVISO] Falta --{nombre}: esta captura no va a registrar ese dato. Ver --help", file=sys.stderr)
 
     duracion = args.duracion
     if duracion <= 0:
@@ -164,8 +236,11 @@ def main():
         sufijo = "_v" if magnitud == "tension" else ""
         ruta = os.path.join(args.outdir, f"{base}{sufijo}.json")
         with open(ruta, "w", encoding="utf-8") as f:
-            json.dump(paquete, f)
+            json.dump(agregar_metadatos(paquete, metadatos), f)
         print(f"Guardado en: {ruta}")
+
+    if metadatos:
+        print("Registrado: " + ", ".join(f"{k}={v}" for k, v in metadatos.items()))
 
 
 if __name__ == "__main__":
